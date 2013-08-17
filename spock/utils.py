@@ -70,7 +70,7 @@ def ByteToHex( byteStr ):
 	#
 	#	return ''.join( hex ).strip()		
 
-	return ''.join( [ "%02X " % ord( x ) for x in byteStr ] ).strip()
+	return ''.join( [ "%02X " % x for x in byteStr ] ).strip()
 
 #TODO: Support 1.6 Server List Ping
 def EncodeSLP(packet):

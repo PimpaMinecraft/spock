@@ -1,5 +1,3 @@
-import select
-import socket
 import signal
 import sys
 import os
@@ -13,9 +11,6 @@ from spock.net.event import Event
 from spock.net import timer, cipher, cflags
 from spock.mcp import mcdata, mcpacket
 from spock import utils, smpmap, bound_buffer
-
-rmask = select.POLLIN|select.POLLERR|select.POLLHUP
-smask = select.POLLOUT|select.POLLIN|select.POLLERR|select.POLLHUP
 
 class Client(object):
 	def __init__(self, **kwargs):
@@ -36,12 +31,8 @@ class Client(object):
 
 		#Initialize socket and poll
 		#Plugins should never touch these unless they know what they're doing
-		self.rpipe, self.wpipe = os.pipe()
-		self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		self.sock.setblocking(0)
-		self.poll = select.poll()
-		self.poll.register(self.rpipe, rmask)
-		self.poll.register(self.sock, smask)
+		self.loop = pyuv.Loop.default_loop()
+		self.tcp = pyuv.TCP(self.loop)
 
 		#Initialize Event Loop/Network variables
 		#Plugins should generally not touch these
@@ -82,54 +73,12 @@ class Client(object):
 		}
 
 	#Convenience method for starting a client
-	def start(self, host = 'localhost', port = 25565):
+	def start(self, host = '0.0.0.0', port = 25565):
 		if self.daemon: self.start_daemon()
 		if (self.start_session(self.mc_username, self.mc_password)['Response'] == "Good to go!"):
-			self.connect(host, port)
-			self.handshake()
-			self.event_loop()
+			self.connect(self.handshake, host, port)
+			self.loop.run()
 		self.exit()
-
-	def event_loop(self):
-		#Set up signal handlers
-		signal.signal(signal.SIGINT, self.signal_handler)
-		signal.signal(signal.SIGTERM, self.signal_handler)
-		#Fire off plugins that need to run after init
-		self.emit('start')
-
-		while not self.kill:
-			flags = self.get_flags()
-			for flag in flags:
-				self.emit(flag)
-			for index, timer in enumerate(self.timers):
-				if timer.update():
-					timer.fire()
-				if not timer.check():
-					del self.timers[index]
-			if self.daemon:
-				sys.stdout.flush()
-				sys.stderr.flush()
-
-	def get_flags(self):
-		flags = []
-		if self.sbuff:
-			self.poll.register(self.sock, smask)
-		else:
-			self.poll.register(self.sock, rmask)
-		try:
-			poll = self.poll.poll(self.timeout)
-		except select.error as e:
-			logging.error(str(e))
-			poll = []
-		if poll:
-			poll = poll[0][1]
-			if poll&select.POLLERR: flags.append('SOCKET_ERR')
-			if poll&select.POLLHUP: flags.append('SOCKET_HUP')
-			if poll&select.POLLOUT: flags.append('SOCKET_SEND')
-			if poll&select.POLLIN:  flags.append('SOCKET_RECV')
-		if self.login_err:              flags.append('LOGIN_ERR'); self.login_err = False
-		if self.auth_err:               flags.append('AUTH_ERR'); self.auth_err = False
-		return flags
 
 	def emit(self, name, data=None):
 		event = (data if name in mcdata.structs else Event(name, data))
@@ -148,41 +97,21 @@ class Client(object):
 	def register_timer(self, timer):
 		self.timers.append(timer)
 
-	def connect(self, host = 'localhost', port = 25565):
+	def connect(self, callback, host = '0.0.0.0', port = 25565):
 		if self.proxy['enabled']:
 			self.host = self.proxy['host']
 			self.port = self.proxy['port']
 		else:
 			self.host = host
 			self.port = port
-		try:
-			print("Attempting to connect to host:", self.host, "port:", self.port)
-			self.sock.connect((self.host, self.port))
-		except socket.error as error:
-			logging.info("Error on Connect (this is normal): " + str(error))
+		print("Attempting to connect to host:", self.host, "port:", self.port)
+		self.tcp.connect((self.host, self.port), callback)
 
 	def kill(self):
 		self.emit('kill')
 		self.kill = True
 
 	def exit(self):
-		flags = self.get_flags()
-		if not 'SOCKET_HUP' in flags:
-			self.push(mcpacket.Packet(ident = 0xFF, data = {
-				'reason': 'disconnect.quitting'
-				})
-			)
-			while self.sbuff:
-				flags = self.get_flags()
-				if ('SOCKET_ERR' in flags) or ('SOCKET_HUP' in flags):
-					break
-				elif 'SOCKET_SEND' in flags:
-					self.emit('SOCKET_SEND')
-			self.sock.close()
-
-		if self.pidfile and os.path.exists(self.pidfile):
-			os.remove(self.pidfile)
-
 		sys.exit(0)
 
 	def enable_crypto(self, SharedSecret):
@@ -191,8 +120,18 @@ class Client(object):
 
 	def push(self, packet):
 		bytes = packet.encode()
-		self.sbuff += (self.cipher.encrypt(bytes) if self.encrypted else bytes)
+		self.tcp.write((self.cipher.encrypt(bytes) if self.encrypted else bytes))
 		self.emit(packet.ident, packet)
+
+	def on_read(self, tcp_handle, data, error):
+		self.rbuff.append(self.cipher.decrypt(data) if self.encrypted else data)
+		try:
+			while True:
+				self.rbuff.save()
+				packet = mcpacket.read_packet(self.rbuff)
+				self.emit(packet.ident, packet)
+		except bound_buffer.BufferUnderflowException:
+			self.rbuff.revert()		
 
 	def start_session(self, username, password = ''):
 		self.mc_username = username
@@ -219,7 +158,7 @@ class Client(object):
 
 		return LoginResponse
 
-	def handshake(self):
+	def handshake(self, tcp_handle, error):
 		self.SharedSecret = Random._UserFriendlyRNG.get_random_bytes(16)
 
 		#Stage 2: Send initial handshake
@@ -230,6 +169,7 @@ class Client(object):
 			'port': self.port,
 			})
 		)
+		self.tcp.start_read(self.on_read)
 
 	def start_daemon(self, daemonize = False):
 		self.daemon = True
